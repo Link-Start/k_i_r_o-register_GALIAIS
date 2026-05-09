@@ -607,6 +607,18 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
             page = await context.new_page()
             await Stealth().apply_stealth_async(page)
 
+            # 拦截 profile.aws API 响应用于调试
+            async def _on_profile_response(response):
+                url = response.url
+                if "profile.aws" in url and "/api/" in url:
+                    try:
+                        body = await response.text()
+                        endpoint = url.split("/api/")[-1]
+                        log(f"[API] {endpoint} → {response.status} {body[:150]}", "dbg")
+                    except Exception:
+                        pass
+            page.on("response", _on_profile_response)
+
             # 注入深度指纹覆盖
             await context.add_init_script(_build_fingerprint_script(fp_config))
 
@@ -824,32 +836,64 @@ async def register(headless=True, auto_login=True, skip_onboard=True,
 
             if state == "OTP":
                 log("阶段 4: OTP 验证")
+                # 等待 profile.aws 页面 React 渲染完成
+                await asyncio.sleep(3)
                 otp_selectors = [
                     'xpath=//input[@inputmode="numeric"]',
                     'xpath=//input[@autocomplete="one-time-code"]',
-                    'xpath=//input[contains(@name,"otp") or contains(@name,"code")]',
-                    'xpath=//input[contains(@id,"otp") or contains(@id,"code")]',
-                    'xpath=//input[contains(@placeholder,"code") or contains(@placeholder,"Code")]',
+                    'xpath=//input[contains(@name,"otp") or contains(@name,"code") or contains(@name,"verif")]',
+                    'xpath=//input[contains(@id,"otp") or contains(@id,"code") or contains(@id,"verif")]',
+                    'xpath=//input[contains(@placeholder,"code") or contains(@placeholder,"Code") or contains(@placeholder,"验证")]',
+                    'xpath=//input[contains(@aria-label,"code") or contains(@aria-label,"verif")]',
+                    'xpath=//input[contains(@class,"verification") or contains(@class,"otp")]',
+                    'css=input[data-testid*="code"]',
+                    'css=input[data-testid*="otp"]',
+                    'css=input[data-testid*="verif"]',
                 ]
                 otp_input = None
-                for sel in otp_selectors:
-                    loc = page.locator(sel)
-                    if await loc.count() > 0 and await loc.first.is_visible():
-                        otp_input = loc.first
+                # 重试最多 3 次，每次等 2 秒（应对 React 渲染延迟）
+                for retry in range(3):
+                    for sel in otp_selectors:
+                        loc = page.locator(sel)
+                        if await loc.count() > 0 and await loc.first.is_visible():
+                            otp_input = loc.first
+                            break
+                    if otp_input:
                         break
-                if not otp_input:
-                    all_inp = page.locator('xpath=//input[not(@type="hidden")]')
+                    # fallback: 找页面上唯一可见的 text/tel/number 输入框
+                    all_inp = page.locator('xpath=//input[not(@type="hidden") and not(@type="password") and not(@type="email")]')
                     for i in range(await all_inp.count()):
                         inp = all_inp.nth(i)
                         if await inp.is_visible():
                             inp_type = await inp.get_attribute("type") or "text"
-                            inp_ph = await inp.get_attribute("placeholder") or ""
-                            if inp_type in ("text", "tel", "number", "") and "Silva" not in inp_ph:
+                            if inp_type in ("text", "tel", "number", ""):
                                 otp_input = inp
                                 break
+                    if otp_input:
+                        break
+                    if retry < 2:
+                        log(f"OTP 输入框未就绪，等待重试 ({retry+1}/3)...")
+                        await asyncio.sleep(2)
 
                 if not otp_input:
-                    log("未找到 OTP 输入框!", "err")
+                    # 调试：dump 页面上所有 input 的属性
+                    debug_info = await page.evaluate("""() => {
+                        const inputs = document.querySelectorAll('input');
+                        return Array.from(inputs).map(el => ({
+                            type: el.type, name: el.name, id: el.id,
+                            placeholder: el.placeholder,
+                            inputmode: el.inputMode,
+                            autocomplete: el.autocomplete,
+                            ariaLabel: el.getAttribute('aria-label'),
+                            className: el.className.substring(0, 80),
+                            dataTestId: el.getAttribute('data-testid'),
+                            visible: el.offsetWidth > 0 && el.offsetHeight > 0,
+                            tagPath: el.closest('[class]')?.className?.substring(0, 60) || ''
+                        }));
+                    }""")
+                    log(f"未找到 OTP 输入框! 页面 input 元素 dump:", "err")
+                    for info in debug_info:
+                        log(f"  {info}", "err")
                     await browser.close()
                     callback_server.shutdown()
                     return _partial_result("OTP输入框未找到")
