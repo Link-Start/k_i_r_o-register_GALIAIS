@@ -13,6 +13,8 @@ kiro_config.json
 
 # 临时测试
 test_*.py
+capture_api.py
+captured_requests.json
 
 # IDE
 .idea/
@@ -21,6 +23,7 @@ test_*.py
 
 # Build
 build/
+build_tmp/
 dist/
 *.exe
 *.spec

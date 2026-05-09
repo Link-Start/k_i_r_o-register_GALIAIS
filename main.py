@@ -116,6 +116,7 @@ DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     email TEXT,
+    password TEXT DEFAULT '',
     provider TEXT,
     authMethod TEXT,
     accessToken TEXT,
@@ -150,6 +151,8 @@ def get_db():
     cols = [r[1] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()]
     if "subscription" not in cols:
         conn.execute("ALTER TABLE accounts ADD COLUMN subscription TEXT DEFAULT ''")
+    if "password" not in cols:
+        conn.execute("ALTER TABLE accounts ADD COLUMN password TEXT DEFAULT ''")
     conn.commit()
     return conn
 
@@ -166,38 +169,61 @@ def db_upsert_account(conn, data):
         existing = conn.execute("SELECT id FROM accounts WHERE email=?", (email,)).fetchone()
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    password = data.get("password", "")
 
     if existing:
-        conn.execute("""
-            UPDATE accounts SET
-                email=?, provider=?, authMethod=?, accessToken=?, refreshToken=?,
-                expiresAt=?, clientId=?, clientSecret=?, clientIdHash=?, region=?,
-                profileArn=?, userId=?, usageLimit=?, currentUsage=?, overageCap=?,
-                currentOverages=?, overageStatus=?, overageCharges=?, subscription=?,
-                lastQueryTime=?, updatedAt=?
-            WHERE id=?
-        """, (
-            email, data.get("provider"), data.get("authMethod"),
-            data.get("accessToken"), data.get("refreshToken"),
-            data.get("expiresAt"), data.get("clientId"), data.get("clientSecret"),
-            data.get("clientIdHash"), data.get("region", "us-east-1"),
-            data.get("profileArn"), user_id,
-            data.get("usageLimit", 0), data.get("currentUsage", 0),
-            data.get("overageCap", 0), data.get("currentOverages", 0),
-            data.get("overageStatus"), data.get("overageCharges", 0.0),
-            data.get("subscription", ""), data.get("lastQueryTime"), now, existing["id"]
-        ))
+        # 只在有新密码时更新密码字段，避免覆盖已有密码
+        if password:
+            conn.execute("""
+                UPDATE accounts SET
+                    email=?, password=?, provider=?, authMethod=?, accessToken=?, refreshToken=?,
+                    expiresAt=?, clientId=?, clientSecret=?, clientIdHash=?, region=?,
+                    profileArn=?, userId=?, usageLimit=?, currentUsage=?, overageCap=?,
+                    currentOverages=?, overageStatus=?, overageCharges=?, subscription=?,
+                    lastQueryTime=?, updatedAt=?
+                WHERE id=?
+            """, (
+                email, password, data.get("provider"), data.get("authMethod"),
+                data.get("accessToken"), data.get("refreshToken"),
+                data.get("expiresAt"), data.get("clientId"), data.get("clientSecret"),
+                data.get("clientIdHash"), data.get("region", "us-east-1"),
+                data.get("profileArn"), user_id,
+                data.get("usageLimit", 0), data.get("currentUsage", 0),
+                data.get("overageCap", 0), data.get("currentOverages", 0),
+                data.get("overageStatus"), data.get("overageCharges", 0.0),
+                data.get("subscription", ""), data.get("lastQueryTime"), now, existing["id"]
+            ))
+        else:
+            conn.execute("""
+                UPDATE accounts SET
+                    email=?, provider=?, authMethod=?, accessToken=?, refreshToken=?,
+                    expiresAt=?, clientId=?, clientSecret=?, clientIdHash=?, region=?,
+                    profileArn=?, userId=?, usageLimit=?, currentUsage=?, overageCap=?,
+                    currentOverages=?, overageStatus=?, overageCharges=?, subscription=?,
+                    lastQueryTime=?, updatedAt=?
+                WHERE id=?
+            """, (
+                email, data.get("provider"), data.get("authMethod"),
+                data.get("accessToken"), data.get("refreshToken"),
+                data.get("expiresAt"), data.get("clientId"), data.get("clientSecret"),
+                data.get("clientIdHash"), data.get("region", "us-east-1"),
+                data.get("profileArn"), user_id,
+                data.get("usageLimit", 0), data.get("currentUsage", 0),
+                data.get("overageCap", 0), data.get("currentOverages", 0),
+                data.get("overageStatus"), data.get("overageCharges", 0.0),
+                data.get("subscription", ""), data.get("lastQueryTime"), now, existing["id"]
+            ))
     else:
         conn.execute("""
             INSERT INTO accounts (
-                email, provider, authMethod, accessToken, refreshToken,
+                email, password, provider, authMethod, accessToken, refreshToken,
                 expiresAt, clientId, clientSecret, clientIdHash, region,
                 profileArn, userId, usageLimit, currentUsage, overageCap,
                 currentOverages, overageStatus, overageCharges, subscription,
                 lastQueryTime, createdAt, updatedAt
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            email, data.get("provider"), data.get("authMethod"),
+            email, password, data.get("provider"), data.get("authMethod"),
             data.get("accessToken"), data.get("refreshToken"),
             data.get("expiresAt"), data.get("clientId"), data.get("clientSecret"),
             data.get("clientIdHash"), data.get("region", "us-east-1"),
@@ -762,7 +788,9 @@ def import_from_local_kiro(conn):
 
 
 def import_from_json_file(conn, file_path):
-    """Import accounts from JSON file (array of account objects)."""
+    """Import accounts from JSON file (array of account objects).
+    Returns (count, emails_list) for selective refresh.
+    """
     with open(file_path, "r", encoding="utf-8") as f:
         accounts = json.load(f)
 
@@ -770,6 +798,7 @@ def import_from_json_file(conn, file_path):
         accounts = [accounts]
 
     imported = 0
+    imported_emails = []
     for acc in accounts:
         usage_data = acc.get("usageData", {})
         breakdown_list = usage_data.get("usageBreakdownList", [])
@@ -777,8 +806,9 @@ def import_from_json_file(conn, file_path):
 
         overage_cfg = usage_data.get("overageConfiguration", {})
 
+        email = acc.get("email", "")
         account_data = {
-            "email": acc.get("email", ""),
+            "email": email,
             "provider": acc.get("provider", ""),
             "authMethod": acc.get("authMethod", ""),
             "accessToken": acc.get("accessToken", ""),
@@ -800,8 +830,10 @@ def import_from_json_file(conn, file_path):
         }
         db_upsert_account(conn, account_data)
         imported += 1
+        if email:
+            imported_emails.append(email)
 
-    return imported
+    return imported, imported_emails
 
 
 def export_to_json(conn, file_path):
@@ -1059,6 +1091,8 @@ class App(tk.Tk):
         self.models_text.tag_configure("dim", foreground="#8b949e")
 
         self.acc_tree.bind("<<TreeviewSelect>>", self._on_acc_select)
+        self.acc_tree.bind("<Button-3>", self._on_acc_right_click)
+        self.acc_tree.bind("<Double-1>", self._on_acc_double_click)
 
         # Log panel
         self._log_label = ttk.Label(bottom_frame, text="操作日志", style="Stats.TLabel")
@@ -1771,6 +1805,7 @@ class App(tk.Tk):
         """Import a successful registration result into the SQLite DB."""
         account_data = {
             "email": result["email"],
+            "password": result.get("password", ""),
             "provider": result.get("provider", "BuilderId"),
             "authMethod": result.get("authMethod", "IdC"),
             "accessToken": result.get("accessToken", ""),
@@ -2202,7 +2237,6 @@ class App(tk.Tk):
             ok, msg = import_from_local_kiro(self.conn)
             if ok:
                 self.after(0, lambda: self._log(msg, "success"))
-                self._refresh_all_tokens_silent()
             else:
                 self.after(0, lambda: self._log(msg, "error"))
             self.after(0, self._load_accounts_from_db)
@@ -2218,13 +2252,47 @@ class App(tk.Tk):
         self._log(f"正在导入: {Path(path).name}")
         def _do():
             try:
-                count = import_from_json_file(self.conn, path)
+                count, emails = import_from_json_file(self.conn, path)
                 self.after(0, lambda: self._log(f"成功导入 {count} 个账号", "success"))
-                self._refresh_all_tokens_silent()
+                self.after(0, self._load_accounts_from_db)
+                if emails:
+                    self._refresh_imported_parallel(emails)
             except Exception as e:
                 self.after(0, lambda: self._log(f"导入失败: {e}", "error"))
             self.after(0, self._load_accounts_from_db)
         threading.Thread(target=_do, daemon=True).start()
+
+    def _refresh_imported_parallel(self, emails):
+        """并行刷新指定邮箱列表的账号 token"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        rows = db_get_all(self.conn)
+        targets = [r for r in rows if r["email"] in emails and r["refreshToken"]]
+        if not targets:
+            return
+
+        def _refresh_one(row):
+            try:
+                at, rt, ea, err = do_refresh_token(row)
+                if err:
+                    return row["email"], False, err
+                db_update_token(self.conn, row["id"], at, rt, ea)
+                _sync_subscription_after_refresh(self.conn, row, at)
+                return row["email"], True, None
+            except Exception as e:
+                return row["email"], False, str(e)
+
+        refreshed = 0
+        with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
+            futures = {pool.submit(_refresh_one, r): r for r in targets}
+            for fut in as_completed(futures):
+                email, ok, err = fut.result()
+                if ok:
+                    refreshed += 1
+                else:
+                    self.after(0, lambda e=email, er=err: self._log(f"刷新失败 ({e}): {er}", "warn"))
+        if refreshed:
+            self.after(0, lambda: self._log(f"已并行刷新 {refreshed}/{len(targets)} 个导入账号", "success"))
+            self.after(0, self._load_accounts_from_db)
 
     def _refresh_all_tokens_silent(self):
         """静默刷新所有账号 token"""
@@ -2390,6 +2458,41 @@ class App(tk.Tk):
     def _on_acc_select(self, event):
         if self._models_visible.get():
             self._show_cached_models()
+
+    def _on_acc_right_click(self, event):
+        iid = self.acc_tree.identify_row(event.y)
+        if not iid:
+            return
+        self.acc_tree.selection_set(iid)
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="查看账号密码", command=lambda: self._show_account_password(iid))
+        menu.add_command(label="复制邮箱", command=lambda: self._copy_field(iid, "email"))
+        menu.add_command(label="复制密码", command=lambda: self._copy_field(iid, "password"))
+        menu.add_separator()
+        menu.add_command(label="删除", command=self._delete_selected)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_acc_double_click(self, event):
+        iid = self.acc_tree.identify_row(event.y)
+        if iid:
+            self._show_account_password(iid)
+
+    def _show_account_password(self, iid):
+        row = self.conn.execute("SELECT email, password FROM accounts WHERE id=?", (int(iid),)).fetchone()
+        if not row:
+            return
+        email = row["email"] or "(未知)"
+        pwd = row["password"] or "(未保存)"
+        messagebox.showinfo("账号信息", f"邮箱: {email}\n密码: {pwd}")
+
+    def _copy_field(self, iid, field):
+        if field not in ("email", "password"):
+            return
+        row = self.conn.execute("SELECT email, password FROM accounts WHERE id=?", (int(iid),)).fetchone()
+        if row and row[field]:
+            self.clipboard_clear()
+            self.clipboard_append(row[field])
+            self._log(f"已复制到剪贴板", "success")
 
     def _show_cached_models(self):
         sel = self.acc_tree.selection()
