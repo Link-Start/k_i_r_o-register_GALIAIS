@@ -48,7 +48,17 @@ class RoxyBrowser:
         r = _requests.get(f"{self.base_url}/browser/workspace", headers=self.headers, timeout=10)
         data = r.json()
         if data.get("code") == 0:
-            return data.get("data", {}).get("list", [])
+            return data.get("data", {}).get("rows", []) or data.get("data", {}).get("list", [])
+        return []
+
+    def list_windows(self, workspace_id: int) -> list:
+        r = _requests.get(
+            f"{self.base_url}/browser/list?workspaceId={workspace_id}",
+            headers=self.headers, timeout=10
+        )
+        data = r.json()
+        if data.get("code") == 0:
+            return data.get("data", {}).get("rows", []) or data.get("data", {}).get("list", [])
         return []
 
     def create_window(self, workspace_id: int, name: str = "", proxy_info: dict = None) -> str | None:
@@ -98,7 +108,7 @@ class RoxyBrowser:
             "dirId": dir_id,
             "headless": headless,
         }
-        r = _requests.post(f"{self.base_url}/browser/open", headers=self.headers, json=payload, timeout=30)
+        r = _requests.post(f"{self.base_url}/browser/open", headers=self.headers, json=payload, timeout=60)
         data = r.json()
         if data.get("code") == 0:
             return data.get("data", {})
@@ -179,28 +189,45 @@ async def register_with_roxy(
         log("未找到工作空间，请先在 RoxyBrowser 中创建", "err")
         return None
     workspace_id = workspaces[0].get("id") or workspaces[0].get("workspaceId")
-    log(f"使用工作空间: {workspaces[0].get('name', workspace_id)}")
+    ws_name = workspaces[0].get("workspaceName") or workspaces[0].get("name", str(workspace_id))
+    log(f"使用工作空间: {ws_name} (id={workspace_id})")
 
-    # 创建浏览器窗口
-    window_name = f"kiro_reg_{int(time.time())}"
-    dir_id = roxy.create_window(workspace_id, window_name, proxy_info=proxy_info)
-    if not dir_id:
-        log("创建浏览器窗口失败!", "err")
-        return None
-    log(f"浏览器窗口已创建: {dir_id[:16]}...")
+    # 优先复用已有的关闭状态窗口，避免每次创建新窗口
+    created_new = False
+    dir_id = None
+    existing_windows = roxy.list_windows(workspace_id)
+    closed_windows = [w for w in existing_windows if w.get("openStatus") == 0]
+    if closed_windows:
+        chosen = _random.choice(closed_windows)
+        dir_id = chosen.get("dirId")
+        log(f"复用已有窗口: {chosen.get('windowName', '')} ({dir_id[:16]}...)")
+        # 随机化指纹
+        roxy.randomize_fingerprint(workspace_id, dir_id)
+        log("已随机化指纹", "ok")
+    else:
+        # 没有可用窗口，创建新的
+        window_name = f"kiro_reg_{int(time.time())}"
+        dir_id = roxy.create_window(workspace_id, window_name, proxy_info=proxy_info)
+        if not dir_id:
+            log("创建浏览器窗口失败!", "err")
+            return None
+        created_new = True
+        log(f"浏览器窗口已创建: {dir_id[:16]}...")
 
     # 打开窗口获取 CDP WebSocket URL
     open_data = roxy.open_window(workspace_id, dir_id, headless=headless)
     if not open_data:
         log("打开浏览器窗口失败!", "err")
-        roxy.delete_window(workspace_id, dir_id)
+        if created_new:
+            roxy.delete_window(workspace_id, dir_id)
         return None
 
     ws_url = open_data.get("ws") or open_data.get("webSocketDebuggerUrl") or open_data.get("wsEndpoint")
     if not ws_url:
         log(f"未获取到 WebSocket URL! 返回数据: {open_data}", "err")
         roxy.close_window(dir_id)
-        roxy.delete_window(workspace_id, dir_id)
+        if created_new:
+            roxy.delete_window(workspace_id, dir_id)
         return None
     log(f"CDP 连接: {ws_url[:60]}...", "ok")
 
@@ -239,7 +266,7 @@ async def register_with_roxy(
             roxy.close_window(dir_id)
         except Exception:
             pass
-        if delete_after:
+        if delete_after and created_new:
             try:
                 roxy.delete_window(workspace_id, dir_id)
             except Exception:
@@ -278,8 +305,6 @@ async def register_with_roxy(
     log("阶段 2: 启动 CDP 浏览器连接")
     authorization_code = ""
 
-    # PLACEHOLDER_CONTINUE_1
-
     class CallbackHandler(BaseHTTPRequestHandler):
         signin_callback_params = {}
 
@@ -311,31 +336,56 @@ async def register_with_roxy(
         def log_message(self_h, *args):
             pass
 
-    # 确保端口可用
+    # 确保端口可用 - 强制清理
     import os, subprocess
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind(("127.0.0.1", 3128))
-        sock.close()
-    except OSError:
-        sock.close()
+    for _kill_attempt in range(3):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            r = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
-            for line in r.stdout.splitlines():
-                if ":3128" in line and "LISTENING" in line:
-                    pid = line.strip().split()[-1]
-                    if pid.isdigit() and int(pid) != os.getpid():
-                        subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
-            await asyncio.sleep(1)
-        except Exception:
-            pass
+            sock.bind(("127.0.0.1", 3128))
+            sock.close()
+            break
+        except OSError:
+            sock.close()
+            try:
+                r = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
+                for line in r.stdout.splitlines():
+                    if ":3128" in line and "LISTENING" in line:
+                        pid = line.strip().split()[-1]
+                        if pid.isdigit() and int(pid) != os.getpid():
+                            subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
+                            log(f"已终止占用端口 3128 的进程 (PID={pid})", "warn")
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
+    else:
+        log("端口 3128 无法释放!", "err")
+        _cleanup()
+        return _partial_result("端口3128被占用")
 
-    callback_server = HTTPServer(("127.0.0.1", 3128), CallbackHandler)
-    callback_server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        callback_server = HTTPServer(("127.0.0.1", 3128), CallbackHandler)
+        callback_server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    except OSError as e:
+        log(f"回调服务器启动失败: {e}", "err")
+        _cleanup()
+        return _partial_result("回调服务器启动失败")
     srv_thread = threading.Thread(target=callback_server.serve_forever, daemon=True)
     srv_thread.start()
-    log("本地回调服务器已启动 (127.0.0.1:3128)", "ok")
+
+    # 验证服务器确实在监听
+    await asyncio.sleep(0.3)
+    try:
+        _check_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _check_sock.settimeout(2)
+        _check_sock.connect(("127.0.0.1", 3128))
+        _check_sock.close()
+        log("本地回调服务器已启动 (127.0.0.1:3128)", "ok")
+    except Exception:
+        log("回调服务器启动后无法连接!", "err")
+        callback_server.shutdown()
+        _cleanup()
+        return _partial_result("回调服务器不可达")
 
     try:
         async with async_playwright() as p:
